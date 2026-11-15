@@ -43,6 +43,7 @@ RETRY_MINUTES = float(os.getenv("RETRY_MINUTES", "45"))  # wait between tries
 ONE_AT_A_TIME = os.getenv("ONE_CALL_AT_A_TIME", "yes").strip().lower() in ("yes", "true", "1", "on")
 AUTO_START_TIME = os.getenv("AUTO_START_TIME", "").strip()  # e.g. 17:00, empty = off
 MAX_CANDIDATES = int(os.getenv("WAITLIST_CANDIDATES_PER_SLOT", "5"))
+OFFERS_PER_DAY = int(os.getenv("WAITLIST_OFFERS_PER_DAY", "1"))  # waitlist calls to one phone number per day
 STOP_HOURS_BEFORE = float(os.getenv("WAITLIST_STOP_HOURS_BEFORE", "2"))
 OFFER_TIMEOUT_MINUTES = float(os.getenv("WAITLIST_OFFER_TIMEOUT_MINUTES", "10"))
 DB_PATH = os.getenv("DB_PATH", str(HERE / "clinic.db"))
@@ -127,6 +128,8 @@ def init_db():
                           ("visit_notes", "TEXT"), ("urgent", "INTEGER DEFAULT 0")]:
             if col not in have:
                 c.execute(f"ALTER TABLE appointments ADD COLUMN {col} {kind}")
+        if "note" not in {r["name"] for r in c.execute("PRAGMA table_info(slots)")}:
+            c.execute("ALTER TABLE slots ADD COLUMN note TEXT")
 
 
 # ---------- helpers ----------
@@ -207,6 +210,9 @@ def visit_info(extracted):
     notes = str(notes).strip() if notes else ""
     if notes.lower() in ("none", "null", "not asked", "n/a"):
         notes = ""
+    answers = [line.split(":", 1)[1].strip().lower() for line in notes.splitlines() if ":" in line]
+    if answers and all(a in ("not answered", "none", "", "n/a") for a in answers):
+        notes = ""  # the questions were never answered, so there is nothing to show
     urgent = str(find_field(extracted, "urgent") or "").strip().lower() == "yes"
     return notes, urgent
 
@@ -228,7 +234,7 @@ def free_slot(c, doctor, d, t):
         "INSERT INTO slots (doctor_name, slot_date, slot_time, status, origin, backfill, created_at) "
         "VALUES (?,?,?,'free','freed','running',?) "
         "ON CONFLICT(doctor_name, slot_date, slot_time) DO UPDATE SET status='free', origin='freed', "
-        "backfill='running', tried=0, held_for=NULL, filled_by=NULL",
+        "backfill='running', tried=0, held_for=NULL, filled_by=NULL, note=NULL",
         (doctor.strip(), d, t, stamp()),
     )
     audit(c, "system", "slot freed", f"{doctor}, {d} {t}")
@@ -493,41 +499,51 @@ async def run_backfill():
     """For each freed slot, offer it to one waitlisted patient at a time."""
     with db() as c:
         slots = c.execute("SELECT * FROM slots WHERE backfill='running' AND status='free'").fetchall()
+    def remark(c, slot_id, text, close=False):
+        c.execute("UPDATE slots SET note=?, backfill=CASE WHEN ? THEN 'open' ELSE backfill END WHERE id=?",
+                  (text, 1 if close else 0, slot_id))
+
     for slot in slots:
-        if ONE_AT_A_TIME:
-            with db() as c:
-                if calls_in_flight(c):
-                    return
         when = slot_dt(slot["slot_date"], slot["slot_time"])
         with db() as c:
-            if now() > when - timedelta(hours=STOP_HOURS_BEFORE) or slot["tried"] >= MAX_CANDIDATES:
-                c.execute("UPDATE slots SET backfill='open' WHERE id=?", (slot["id"],))
+            if now() > when - timedelta(hours=STOP_HOURS_BEFORE):
+                remark(c, slot["id"], f"Less than {STOP_HOURS_BEFORE:g} hours before the appointment, so no more calls.", close=True)
+                continue
+            if slot["tried"] >= MAX_CANDIDATES:
+                remark(c, slot["id"], f"Tried {slot['tried']} waitlist patients and nobody took it.", close=True)
                 continue
             if not in_calling_window():
+                remark(c, slot["id"], f"Waiting for calling hours ({WINDOW_START}:00 to {WINDOW_END}:00).")
                 continue
+            if ONE_AT_A_TIME and calls_in_flight(c):
+                remark(c, slot["id"], "Waiting for the current call to finish.")
+                return
             day = DAYS[when.weekday()]
             today = now().date().isoformat()
-            candidates = c.execute(
-                "SELECT * FROM waitlist w WHERE status='active' AND doctor_name=? "
-                "AND phone NOT IN (SELECT phone FROM do_not_call) "
-                "AND id NOT IN (SELECT waitlist_id FROM offers WHERE slot_id=?) "
-                "AND phone NOT IN (SELECT w2.phone FROM offers o JOIN waitlist w2 ON w2.id=o.waitlist_id "
-                "                  WHERE substr(o.created_at,1,10)=?) "
-                "ORDER BY created_at, id",
-                (slot["doctor_name"], slot["id"], today),
-            ).fetchall()
-            candidates = [w for w in candidates if w["days"] in ("", "any") or day in w["days"].split(",")]
+            pool = c.execute("SELECT * FROM waitlist WHERE status='active' AND doctor_name=? ORDER BY created_at, id",
+                             (slot["doctor_name"],)).fetchall()
+            offered_here = {r[0] for r in c.execute("SELECT waitlist_id FROM offers WHERE slot_id=?", (slot["id"],))}
+            blocked = {r[0] for r in c.execute("SELECT phone FROM do_not_call")}
+            today_counts = dict(c.execute(
+                "SELECT w.phone, COUNT(*) FROM offers o JOIN waitlist w ON w.id=o.waitlist_id "
+                "WHERE substr(o.created_at,1,10)=? GROUP BY w.phone", (today,)).fetchall())
+            fresh = [w for w in pool if w["id"] not in offered_here and w["phone"] not in blocked]
+            right_day = [w for w in fresh if w["days"] in ("", "any") or day in w["days"].split(",")]
+            candidates = [w for w in right_day if today_counts.get(w["phone"], 0) < OFFERS_PER_DAY]
             if not candidates:
-                # Nobody to try right now. Keep looking only if someone was skipped for today.
-                waiting = c.execute(
-                    "SELECT COUNT(*) n FROM waitlist WHERE status='active' AND doctor_name=? "
-                    "AND id NOT IN (SELECT waitlist_id FROM offers WHERE slot_id=?)",
-                    (slot["doctor_name"], slot["id"])).fetchone()["n"]
-                if not waiting:
-                    c.execute("UPDATE slots SET backfill='open' WHERE id=?", (slot["id"],))
+                if not pool:
+                    remark(c, slot["id"], f"Nobody on the waitlist is waiting for {slot['doctor_name']}.", close=True)
+                elif not fresh:
+                    remark(c, slot["id"], "Everyone on the waitlist for this doctor has already been offered this slot.", close=True)
+                elif not right_day:
+                    remark(c, slot["id"], f"Nobody {'else ' if slot['tried'] else ''}on the waitlist for this doctor can come on a {when.strftime('%A')}.", close=True)
+                else:
+                    # They are eligible but have had their offer(s) for today. Try again tomorrow.
+                    remark(c, slot["id"], f"Eligible patients have already had {OFFERS_PER_DAY} waitlist call(s) today "
+                                          "(the daily limit). Will try again tomorrow.")
                 continue
             person = candidates[0]
-            c.execute("UPDATE slots SET status='held', held_for=? WHERE id=? AND status='free'",
+            c.execute("UPDATE slots SET status='held', held_for=?, note=NULL WHERE id=? AND status='free'",
                       (f"wait:{person['id']}", slot["id"]))
 
         user_data = {
@@ -547,9 +563,13 @@ async def run_backfill():
                 c.execute("INSERT INTO offers (slot_id, waitlist_id, execution_id, created_at) VALUES (?,?,?,?)",
                           (slot["id"], person["id"], execution_id, stamp()))
                 log_attempt_start(c, "waitlist", person["id"], execution_id)
-        except Exception:
+        except Exception as err:
+            detail = getattr(getattr(err, "response", None), "text", "") or str(err)
             with db() as c:
                 release_holds(c, f"wait:{person['id']}")
+                # Count it as a try so a failing call cannot repeat forever.
+                c.execute("UPDATE slots SET tried=tried+1, note=? WHERE id=?",
+                          (f"Could not place the call to {person['patient_name']}: {detail[:200]}", slot["id"]))
 
 
 def finish_offer(offer, ex=None, expired=False):
@@ -745,8 +765,9 @@ def freed_slots_panel(c):
             pill, text = "running", "Looking for a waitlist patient"
         else:
             pill, text = "open", "Still open"
+        why = f"<br><span class='muted'>{e(s['note'])}</span>" if s["note"] and s["status"] == "free" else ""
         out.append(f"<tr><td>{e(s['slot_date'])} {e(s['slot_time'])}</td><td>{e(s['doctor_name'])}</td>"
-                   f"<td><span class='pill {pill}'>{text}</span></td><td>{s['tried']}</td></tr>")
+                   f"<td><span class='pill {pill}'>{text}</span>{why}</td><td>{s['tried']}</td></tr>")
     out.append("</table></div>")
     return "".join(out)
 
@@ -1372,6 +1393,9 @@ def waitlist_add(patient_name: str = Form(...), phone: str = Form(...), doctor_n
             return go("/waitlist", "This person asked not to be called, so they cannot be added.")
         c.execute("INSERT INTO waitlist (patient_name, phone, doctor_name, days, preferred_language, created_at) "
                   "VALUES (?,?,?,?,?,?)", (patient_name.strip(), number, doctor_name.strip(), chosen, preferred_language, stamp()))
+        # A new person is waiting, so look again at this doctor's slots that are still open.
+        c.execute("UPDATE slots SET backfill='running', note=NULL WHERE origin='freed' AND status='free' "
+                  "AND backfill='open' AND doctor_name=? AND tried<?", (doctor_name.strip(), MAX_CANDIDATES))
         audit(c, "receptionist", "added to waitlist" + (" from a voice note" if from_note else ""),
               f"{patient_name.strip()} ({doctor_name.strip()})", "", from_note[:200])
     return go("/waitlist")
