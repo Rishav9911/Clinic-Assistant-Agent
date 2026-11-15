@@ -1003,8 +1003,58 @@ def doctor_datalist(c):
     return "<datalist id='doctors'>" + "".join(f"<option value='{e(n)}'>" for n in sorted(names) if n) + "</datalist>"
 
 
+@app.post("/slots/note", response_class=HTMLResponse)
+def slots_note(note: str = Form("")):
+    """Read a dictated note and show the slots it describes as a draft to check."""
+    if not note.strip():
+        return go("/slots", "The note was empty.")
+    with db() as c:
+        doctors = ({r[0] for r in c.execute("SELECT DISTINCT doctor_name FROM appointments")}
+                   | {r[0] for r in c.execute("SELECT DISTINCT doctor_name FROM slots")}
+                   | {r[0] for r in c.execute("SELECT DISTINCT doctor_name FROM waitlist")})
+    return slots_page(draft=parse_slot_note(note, doctors))
+
+
+def add_one_slot(c, doctor_name, slot_date, slot_time, how="added free slot"):
+    """Add one free slot. Returns a reason if it could not be added, otherwise None."""
+    if not doctor_name or not valid_date_time(slot_date, slot_time):
+        return "not a valid date and time"
+    if slot_dt(slot_date, slot_time) < now():
+        return "already in the past"
+    taken = c.execute(
+        "SELECT patient_name FROM appointments WHERE doctor_name=? COLLATE NOCASE AND appointment_date=? "
+        "AND appointment_time=? AND status!='cancelled'", (doctor_name, slot_date, slot_time)).fetchone()
+    if taken:
+        return f"{taken['patient_name']} has an appointment then"
+    cur = c.execute("INSERT OR IGNORE INTO slots (doctor_name, slot_date, slot_time, created_at) VALUES (?,?,?,?)",
+                    (doctor_name, slot_date, slot_time, stamp()))
+    if not cur.rowcount:
+        return "already in the list"
+    audit(c, "receptionist", how, f"{doctor_name}, {slot_date} {slot_time}")
+    return None
+
+
+@app.post("/slots/add-many")
+def slots_add_many(doctor_name: str = Form(...), slot: list[str] = Form(default=[]), from_note: str = Form("")):
+    doctor_name = doctor_name.strip()
+    added, skipped = 0, []
+    with db() as c:
+        for item in slot:
+            d, _, t = item.partition("|")
+            why = add_one_slot(c, doctor_name, d, t, "added free slot from a voice note")
+            if why:
+                skipped.append(f"{d} {t} ({why})")
+            else:
+                added += 1
+    msg = f"Added {added} free slot(s) for {doctor_name}."
+    if skipped:
+        msg += " Skipped: " + "; ".join(skipped)
+    return go("/slots", msg)
+
+
 @app.get("/slots", response_class=HTMLResponse)
-def slots_page(msg: str = ""):
+def slots_page(msg: str = "", draft: dict | None = None):
+    d = draft if isinstance(draft, dict) else {}
     with db() as c:
         rows = c.execute("SELECT * FROM slots WHERE slot_date >= ? ORDER BY slot_date, slot_time, doctor_name",
                          (now().date().isoformat(),)).fetchall()
@@ -1013,7 +1063,26 @@ def slots_page(msg: str = ""):
            "up to 3 of these with the same doctor. Slots from cancelled appointments appear here on their own.</p>"]
     if msg:
         out.append(f"<div class='warn'>{e(msg)}</div>")
-    out.append(f"<div class='card'><form method='post' action='/slots/add' class='row'>{dl}"
+    out.append("<div class='card'><h2>Add by voice note</h2>"
+               "<p class='muted'>Click in the box, hold your Wispr Flow key and speak. For example: "
+               "&ldquo;Doctor Rao is free on Tuesday at 11 AM and 4 PM.&rdquo;</p>"
+               "<form method='post' action='/slots/note'>"
+               f"<textarea name='note' rows='2' style='width:100%;box-sizing:border-box;padding:8px;font-size:14px;border:1px solid #cbd0d9;border-radius:6px' "
+               f"placeholder='Speak or type when a doctor is free' required>{e(d.get('note', ''))}</textarea>"
+               "<div style='margin-top:8px'><button>Read note</button></div></form></div>")
+    if d:
+        gaps = (" I could not find: " + ", ".join(d["missing"]) + ".") if d["missing"] else ""
+        remarks = " ".join(d["remarks"])
+        out.append(f"<div class='warn'>Draft from your note. Untick anything wrong, then click Add these slots.{e(gaps)} {e(remarks)}</div>")
+        ticks = "".join(
+            f"<label style='display:block;margin:4px 0'><input type='checkbox' name='slot' value='{e(sd)}|{e(st)}' checked> "
+            f"{e(spoken_date(sd))} at {e(spoken_time(st))} <span class='muted'>({e(sd)} {e(st)})</span></label>"
+            for sd, st in d["slots"]) or "<p class='muted'>No slots could be read from the note. Use the form below instead.</p>"
+        out.append(f"<div class='card'><h2>Check the draft</h2><form method='post' action='/slots/add-many'>{dl}"
+                   f"<input name='doctor_name' list='doctors' placeholder='Doctor name' value='{e(d['doctor_name'])}' required>"
+                   f"<input type='hidden' name='from_note' value='{e(d['note'])}'>{ticks}"
+                   f"<div style='margin-top:8px'><button {'' if d['slots'] else 'disabled'}>Add these slots</button></div></form></div>")
+    out.append(f"<div class='card'><h2>Add by typing</h2><form method='post' action='/slots/add' class='row'>{dl}"
                "<input name='doctor_name' list='doctors' placeholder='Doctor name' required>"
                "<input type='date' name='slot_date' required><input type='time' name='slot_time' required>"
                "<button>Add free slot</button></form></div>")
@@ -1035,20 +1104,9 @@ def slots_page(msg: str = ""):
 @app.post("/slots/add")
 def slots_add(doctor_name: str = Form(...), slot_date: str = Form(...), slot_time: str = Form(...)):
     doctor_name, slot_time = doctor_name.strip(), slot_time[:5]
-    if not doctor_name or not valid_date_time(slot_date, slot_time):
-        return go("/slots", "Please give a doctor, a date and a time.")
     with db() as c:
-        taken = c.execute(
-            "SELECT patient_name FROM appointments WHERE doctor_name=? COLLATE NOCASE AND appointment_date=? "
-            "AND appointment_time=? AND status!='cancelled'", (doctor_name, slot_date, slot_time)).fetchone()
-        if taken:
-            return go("/slots", f"That time is not free: {taken['patient_name']} has an appointment then.")
-        cur = c.execute("INSERT OR IGNORE INTO slots (doctor_name, slot_date, slot_time, created_at) VALUES (?,?,?,?)",
-                        (doctor_name, slot_date, slot_time, stamp()))
-        if not cur.rowcount:
-            return go("/slots", "That slot is already in the list.")
-        audit(c, "receptionist", "added free slot", f"{doctor_name}, {slot_date} {slot_time}")
-    return go("/slots")
+        why = add_one_slot(c, doctor_name, slot_date, slot_time)
+    return go("/slots", f"Not added: {why}." if why else "")
 
 
 @app.post("/slots/delete/{slot_id}")
@@ -1114,6 +1172,86 @@ def parse_note(text, known_doctors):
     missing = [label for label, value in [("patient name", name), ("phone number", phone), ("doctor", doctor)] if not value]
     return {"patient_name": name, "phone": phone, "doctor_name": doctor, "days": days,
             "preferred_language": language, "note": raw, "missing": missing}
+
+
+MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+
+def find_doctor(work, known_doctors):
+    key = _doc_key(work)
+    for name in sorted(known_doctors, key=len, reverse=True):
+        if name and _doc_key(name) in key:
+            return name
+    m = re.search(r"\b(?:doctor|dr)\b\.?\s+[A-Za-z]+", work, flags=re.I)
+    return "Doctor " + m.group().split()[-1].title() if m else ""
+
+
+def parse_slot_note(text, known_doctors):
+    """Turn a dictated sentence into draft free slots (every date with every time). Staff must check it."""
+    raw = " ".join(text.split())
+    doctor = find_doctor(raw, known_doctors)
+    work = re.sub(r"\b(?:doctor|dr)\b\.?\s+[A-Za-z]+", " ", raw, flags=re.I).lower()
+    today = now().date()
+    dates, remarks = [], []
+
+    def add_date(d):
+        if d not in dates:
+            dates.append(d)
+
+    def from_day_month(day, month, year=None):
+        try:
+            d = datetime(year or today.year, month, day).date()
+            if not year and d < today:
+                d = datetime(today.year + 1, month, day).date()
+            add_date(d)
+        except ValueError:
+            remarks.append(f"'{day}/{month}' is not a real date, so I left it out.")
+
+    mon = "(" + "|".join(MONTHS) + ")[a-z]*"
+    patterns = [
+        (r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", lambda m: from_day_month(int(m[3]), int(m[2]), int(m[1]))),
+        (r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b",
+         lambda m: from_day_month(int(m[1]), int(m[2]), (int(m[3]) + (2000 if int(m[3]) < 100 else 0)) if m[3] else None)),
+        (r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?" + mon + r"\b", lambda m: from_day_month(int(m[1]), MONTHS[m[2]])),
+        (r"\b" + mon + r"\s+(\d{1,2})(?:st|nd|rd|th)?\b", lambda m: from_day_month(int(m[2]), MONTHS[m[1]])),
+        (r"\bday after tomorrow\b", lambda m: add_date(today + timedelta(days=2))),
+        (r"\btomorrow\b", lambda m: add_date(today + timedelta(days=1))),
+        (r"\btoday\b", lambda m: add_date(today)),
+    ]
+    for pattern, action in patterns:
+        for m in re.finditer(pattern, work):
+            action(m)
+        work = re.sub(pattern, " ", work)
+    for m in re.finditer(r"\b(mon|tues?|wed(?:nes)?|thur?s?|fri|sat(?:ur)?|sun)(?:day)?s?\b", work):
+        target = DAYS.index(m[1][:3])
+        ahead = (target - today.weekday()) % 7 or 7
+        add_date(today + timedelta(days=ahead))
+    work = re.sub(r"\b(mon|tues?|wed(?:nes)?|thur?s?|fri|sat(?:ur)?|sun)(?:day)?s?\b", " ", work)
+
+    times = []
+    if re.search(r"\bnoon\b", work):
+        times.append("12:00")
+    for m in re.finditer(r"\b(\d{1,2})(?:[:.](\d{2}))?(?:\s*(a\.?\s?m\b\.?|p\.?\s?m\b\.?))?(?:\s+in the (morning|afternoon|evening))?", work):
+        hour, minute = int(m[1]), int(m[2] or 0)
+        half = (m[3] or "").replace(".", "").replace(" ", "") or {"morning": "am", "afternoon": "pm", "evening": "pm"}.get(m[4] or "", "")
+        if hour > 23 or minute > 59:
+            continue
+        if half == "pm" and hour < 12:
+            hour += 12
+        elif half == "am" and hour == 12:
+            hour = 0
+        elif not half and not m[2] and 1 <= hour <= 7:
+            hour += 12
+            remarks.append(f"No AM or PM heard for {m[1]}, so I assumed {m[1]} PM.")
+        elif not half and not m[2] and 8 <= hour <= 11:
+            remarks.append(f"No AM or PM heard for {m[1]}, so I assumed {m[1]} AM.")
+        t = f"{hour:02d}:{minute:02d}"
+        if t not in times:
+            times.append(t)
+
+    missing = [label for label, value in [("doctor", doctor), ("date", dates), ("time", times)] if not value]
+    slots = [(d.isoformat(), t) for d in sorted(dates) for t in sorted(times)]
+    return {"doctor_name": doctor, "slots": slots, "remarks": remarks, "missing": missing, "note": raw}
 
 
 # ---------- waitlist page ----------
