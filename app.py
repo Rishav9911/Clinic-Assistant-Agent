@@ -11,6 +11,7 @@ import csv
 import html
 import io
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
@@ -1060,10 +1061,78 @@ def slots_delete(slot_id: int):
     return go("/slots")
 
 
+# ---------- voice note to waitlist entry ----------
+
+DAY_WORDS = {"mon": "mon", "monday": "mon", "tue": "tue", "tues": "tue", "tuesday": "tue", "wed": "wed",
+             "wednesday": "wed", "thu": "thu", "thur": "thu", "thurs": "thu", "thursday": "thu", "fri": "fri",
+             "friday": "fri", "sat": "sat", "saturday": "sat", "sun": "sun", "sunday": "sun"}
+
+
+def _doc_key(name):
+    return re.sub(r"\s+", " ", re.sub(r"\bdr\b\.?", "doctor", name.lower())).strip()
+
+
+def parse_note(text, known_doctors):
+    """Turn a dictated sentence into a draft waitlist entry. Simple word rules, so staff must check it."""
+    raw = " ".join(text.split())
+    work = raw
+
+    phone = ""
+    m = re.search(r"(?:\+?91[\s-]?)?(?:\d[\s-]?){10}", work)
+    if m:
+        phone = re.sub(r"\D", "", m.group())[-10:]
+        work = work[:m.start()] + " " + work[m.end():]
+
+    doctor = ""
+    key = _doc_key(work)
+    for name in sorted(known_doctors, key=len, reverse=True):
+        if name and _doc_key(name) in key:
+            doctor = name
+            break
+    doc_match = re.search(r"\b(?:doctor|dr)\b\.?\s+[A-Za-z]+", work, flags=re.I)
+    if not doctor and doc_match:
+        doctor = "Doctor " + doc_match.group().split()[-1].title()
+
+    low = work.lower()
+    days = [DAY_WORDS[w] for w in re.findall(r"[a-z]+", low) if w.rstrip("s") in DAY_WORDS or w in DAY_WORDS
+            for w in [w if w in DAY_WORDS else w.rstrip("s")]]
+    if "weekday" in low:
+        days += ["mon", "tue", "wed", "thu", "fri"]
+    if "weekend" in low:
+        days += ["sat", "sun"]
+    days = [d for d in DAYS if d in days]
+
+    language = "hi" if re.search(r"\bhindi\b", low) else "en"
+
+    name = re.sub(r"^(please\s+)?(add|put|note that|note|waitlist)\s+", "", work, flags=re.I)
+    name = re.split(r"\b(can|could|wants?|would|is|needs?|prefers?|to the|on the|for|any|available|number|phone|speaks?|with)\b",
+                    name, maxsplit=1, flags=re.I)[0]
+    if doc_match and doc_match.group().lower() in name.lower():
+        name = ""
+    name = name.strip(" ,.-")
+
+    missing = [label for label, value in [("patient name", name), ("phone number", phone), ("doctor", doctor)] if not value]
+    return {"patient_name": name, "phone": phone, "doctor_name": doctor, "days": days,
+            "preferred_language": language, "note": raw, "missing": missing}
+
+
 # ---------- waitlist page ----------
 
+@app.post("/waitlist/note", response_class=HTMLResponse)
+def waitlist_note(note: str = Form("")):
+    """Read a dictated note and show it as a draft entry for the receptionist to check."""
+    if not note.strip():
+        return go("/waitlist", "The note was empty.")
+    with db() as c:
+        doctors = ({r[0] for r in c.execute("SELECT DISTINCT doctor_name FROM appointments")}
+                   | {r[0] for r in c.execute("SELECT DISTINCT doctor_name FROM slots")}
+                   | {r[0] for r in c.execute("SELECT DISTINCT doctor_name FROM waitlist")})
+    return waitlist_page(draft=parse_note(note, doctors))
+
+
 @app.get("/waitlist", response_class=HTMLResponse)
-def waitlist_page(msg: str = ""):
+def waitlist_page(msg: str = "", draft: dict | None = None):
+    d = draft if isinstance(draft, dict) else {}
     with db() as c:
         rows = c.execute("SELECT * FROM waitlist WHERE status!='removed' ORDER BY status, created_at").fetchall()
         dl = doctor_datalist(c)
@@ -1071,12 +1140,25 @@ def waitlist_page(msg: str = ""):
            "called one at a time, longest wait first, until someone takes it.</p>"]
     if msg:
         out.append(f"<div class='warn'>{e(msg)}</div>")
-    days = "".join(f"<label><input type='checkbox' name='days' value='{d}'> {d.title()}</label>" for d in DAYS)
-    out.append(f"<div class='card'><form method='post' action='/waitlist/add'>{dl}<div class='row'>"
-               "<input name='patient_name' placeholder='Patient name' required>"
-               "<input name='phone' placeholder='Phone number' required>"
-               "<input name='doctor_name' list='doctors' placeholder='Doctor name' required>"
-               "<select name='preferred_language'><option value='en'>English</option><option value='hi'>Hindi</option></select></div>"
+    out.append("<div class='card'><h2>Add by voice note</h2>"
+               "<p class='muted'>Click in the box, hold your Wispr Flow key and speak. For example: "
+               "&ldquo;Mr Gowda can come any morning this week for Doctor Rao, number 98765 43210.&rdquo;</p>"
+               "<form method='post' action='/waitlist/note'>"
+               f"<textarea name='note' rows='2' style='width:100%;box-sizing:border-box;padding:8px;font-size:14px;border:1px solid #cbd0d9;border-radius:6px' "
+               f"placeholder='Speak or type a note about a waiting patient' required>{e(d.get('note', ''))}</textarea>"
+               "<div style='margin-top:8px'><button>Read note</button></div></form></div>")
+    if d:
+        gaps = (" I could not find: " + ", ".join(d["missing"]) + ". Please fill those in.") if d.get("missing") else ""
+        out.append(f"<div class='warn'>Draft from your note. Check every box below, then click Add to waitlist.{e(gaps)}</div>")
+    v = lambda k: e(str(d.get(k, "")))
+    days = "".join(f"<label><input type='checkbox' name='days' value='{x}' {'checked' if x in d.get('days', []) else ''}> {x.title()}</label>" for x in DAYS)
+    hi = "selected" if d.get("preferred_language") == "hi" else ""
+    out.append(f"<div class='card'><h2>{'Check the draft' if d else 'Add by typing'}</h2><form method='post' action='/waitlist/add'>{dl}<div class='row'>"
+               f"<input name='patient_name' placeholder='Patient name' value='{v('patient_name')}' required>"
+               f"<input name='phone' placeholder='Phone number' value='{v('phone')}' required>"
+               f"<input name='doctor_name' list='doctors' placeholder='Doctor name' value='{v('doctor_name')}' required>"
+               f"<select name='preferred_language'><option value='en'>English</option><option value='hi' {hi}>Hindi</option></select>"
+               f"<input type='hidden' name='from_note' value='{v('note')}'></div>"
                f"<div class='row' style='margin-top:10px'><span class='muted'>Days they can come (leave empty for any day):</span>{days}"
                "<button>Add to waitlist</button></div></form></div>")
     if rows:
@@ -1095,7 +1177,8 @@ def waitlist_page(msg: str = ""):
 
 @app.post("/waitlist/add")
 def waitlist_add(patient_name: str = Form(...), phone: str = Form(...), doctor_name: str = Form(...),
-                 preferred_language: str = Form("en"), days: list[str] = Form(default=[])):
+                 preferred_language: str = Form("en"), days: list[str] = Form(default=[]),
+                 from_note: str = Form("")):
     number = to_e164(phone)
     if not number:
         return go("/waitlist", f"Phone number '{phone}' is not valid.")
@@ -1105,7 +1188,8 @@ def waitlist_add(patient_name: str = Form(...), phone: str = Form(...), doctor_n
             return go("/waitlist", "This person asked not to be called, so they cannot be added.")
         c.execute("INSERT INTO waitlist (patient_name, phone, doctor_name, days, preferred_language, created_at) "
                   "VALUES (?,?,?,?,?,?)", (patient_name.strip(), number, doctor_name.strip(), chosen, preferred_language, stamp()))
-        audit(c, "receptionist", "added to waitlist", f"{patient_name.strip()} ({doctor_name.strip()})")
+        audit(c, "receptionist", "added to waitlist" + (" from a voice note" if from_note else ""),
+              f"{patient_name.strip()} ({doctor_name.strip()})", "", from_note[:200])
     return go("/waitlist")
 
 
