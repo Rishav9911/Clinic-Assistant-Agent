@@ -38,6 +38,9 @@ WINDOW_END = int(os.getenv("CALL_WINDOW_END", "20"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))      # first call + 2 retries
 RETRY_MINUTES = float(os.getenv("RETRY_MINUTES", "45"))  # wait between tries
+# yes = call one patient at a time and wait for each call to finish (good for demos).
+# no  = call everyone on the list together.
+ONE_AT_A_TIME = os.getenv("ONE_CALL_AT_A_TIME", "yes").strip().lower() in ("yes", "true", "1", "on")
 AUTO_START_TIME = os.getenv("AUTO_START_TIME", "").strip()  # e.g. 17:00, empty = off
 MAX_CANDIDATES = int(os.getenv("WAITLIST_CANDIDATES_PER_SLOT", "5"))
 STOP_HOURS_BEFORE = float(os.getenv("WAITLIST_STOP_HOURS_BEFORE", "2"))
@@ -243,7 +246,7 @@ def hold_slots_for(c, appt):
     # Share the free slots fairly between everyone still to be called for this doctor,
     # so the first call does not take them all. Each slot is offered on one call at a time.
     others = c.execute(
-        "SELECT COUNT(*) n FROM appointments WHERE status IN ('pending','retry_wait') AND id!=? "
+        "SELECT COUNT(*) n FROM appointments WHERE status IN ('pending','queued','retry_wait') AND id!=? "
         "AND doctor_name=? COLLATE NOCASE", (appt["id"], appt["doctor_name"].strip())).fetchone()["n"]
     picked = usable[:min(3, max(1, len(usable) // (others + 1)))]
     for r in picked:
@@ -323,12 +326,44 @@ async def call_one(client, appt):
             c.execute("UPDATE appointments SET error=? WHERE id=?", (detail[:300], appt["id"]))
 
 
+def calls_in_flight(c):
+    return (c.execute("SELECT COUNT(*) n FROM appointments WHERE status='calling'").fetchone()["n"]
+            + c.execute("SELECT COUNT(*) n FROM offers WHERE status='calling'").fetchone()["n"])
+
+
+async def call_next_in_queue():
+    """One-at-a-time mode: when no call is running, call the next patient waiting in the queue."""
+    if not ONE_AT_A_TIME:
+        return
+    with db() as c:
+        if calls_in_flight(c):
+            return
+        if not in_calling_window():
+            c.execute("UPDATE appointments SET status='pending' WHERE status='queued'")
+            return
+        appt = c.execute(
+            "SELECT * FROM appointments WHERE status='queued' AND phone NOT IN (SELECT phone FROM do_not_call) "
+            "ORDER BY appointment_date, appointment_time, id LIMIT 1").fetchone()
+    if appt:
+        async with httpx.AsyncClient() as client:
+            await call_one(client, appt)
+        with db() as c:  # if the call could not be placed, do not block the queue
+            c.execute("UPDATE appointments SET status='needs_human' WHERE id=? AND status='queued' AND error IS NOT NULL",
+                      (appt["id"],))
+
+
 async def start_calls():
     with db() as c:
         rows = c.execute(
             "SELECT * FROM appointments WHERE status='pending' "
             "AND phone NOT IN (SELECT phone FROM do_not_call)"
         ).fetchall()
+        if ONE_AT_A_TIME:
+            c.execute("UPDATE appointments SET status='queued' WHERE status='pending' "
+                      "AND phone NOT IN (SELECT phone FROM do_not_call)")
+    if ONE_AT_A_TIME:
+        await call_next_in_queue()
+        return len(rows)
     async with httpx.AsyncClient() as client:
         for appt in rows:
             await call_one(client, appt)
@@ -345,6 +380,8 @@ async def place_due_retries():
         if rows and not in_calling_window():
             c.execute("UPDATE appointments SET status='unreachable', next_call_at=NULL WHERE status='retry_wait'")
             return
+        if ONE_AT_A_TIME:
+            rows = [] if calls_in_flight(c) else rows[:1]
     if rows:
         async with httpx.AsyncClient() as client:
             for appt in rows:
@@ -457,6 +494,10 @@ async def run_backfill():
     with db() as c:
         slots = c.execute("SELECT * FROM slots WHERE backfill='running' AND status='free'").fetchall()
     for slot in slots:
+        if ONE_AT_A_TIME:
+            with db() as c:
+                if calls_in_flight(c):
+                    return
         when = slot_dt(slot["slot_date"], slot["slot_time"])
         with db() as c:
             if now() > when - timedelta(hours=STOP_HOURS_BEFORE) or slot["tried"] >= MAX_CANDIDATES:
@@ -615,7 +656,7 @@ async def auto_start():
 
 async def loop_forever():
     while True:
-        for step in (poll_once, poll_offers, place_due_retries, run_backfill, auto_start):
+        for step in (poll_once, poll_offers, run_backfill, place_due_retries, call_next_in_queue, auto_start):
             try:
                 await step()
             except Exception as e:  # one failing step must not stop the others
@@ -653,7 +694,7 @@ th{color:#5b6472;font-weight:600;font-size:12px;text-transform:uppercase}
 .pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600;background:#e8eaef;white-space:nowrap}
 .confirmed,.filled{background:#d9f2e3;color:#12643a}.cancelled{background:#fde2e0;color:#8f1d15}
 .needs_human,.open{background:#fff0cc;color:#7a5200}.unreachable{background:#e3e6ec;color:#3d4654}
-.do_not_call{background:#ead9f7;color:#5a1e8a}.calling,.retry_wait,.offering,.running{background:#dbe9ff;color:#124a9c}
+.do_not_call{background:#ead9f7;color:#5a1e8a}.calling,.queued,.retry_wait,.offering,.running{background:#dbe9ff;color:#124a9c}
 .rescheduled{background:#d5f0f3;color:#0b5560}
 button{background:#1d4ed8;color:#fff;border:0;border-radius:8px;padding:9px 16px;font-size:14px;cursor:pointer}
 button.grey{background:#6b7280} button:disabled{background:#b6bcc8;cursor:not-allowed}
@@ -668,7 +709,7 @@ select.small{padding:3px;font-size:12px}
 details summary{cursor:pointer;color:#1d4ed8} pre{white-space:pre-wrap;font-size:12px;background:#f5f6f8;padding:8px;border-radius:6px}
 """
 
-LABELS = {"pending": "Not called yet", "calling": "Calling now", "retry_wait": "Will retry", "confirmed": "Confirmed",
+LABELS = {"pending": "Not called yet", "queued": "Waiting in queue", "calling": "Calling now", "retry_wait": "Will retry", "confirmed": "Confirmed",
           "rescheduled": "Rescheduled", "cancelled": "Cancelled", "needs_human": "Needs a human",
           "unreachable": "Unreachable", "do_not_call": "Do not call"}
 
@@ -731,12 +772,13 @@ def dashboard(msg: str = "", status: str = "", date: str = ""):
     rows = [r for r in in_date if not status or r["status"] == status]
     all_pending = sum(1 for r in all_rows if r["status"] == "pending")
     calling = any(r["status"] == "calling" for r in all_rows)
-    busy = calling or offers_running or any(r["status"] == "retry_wait" for r in all_rows)
+    busy = calling or offers_running or any(r["status"] in ("retry_wait", "queued") for r in all_rows)
 
     out = [f"<h1>{e(CLINIC_NAME)}: appointment confirmations</h1>",
            f"<p class='sub'>Updated {now().strftime('%d %b, %I:%M:%S %p')}"
            + (" · refreshing every 10 seconds while calls run" if busy else "")
-           + (f" · calls start automatically at {e(AUTO_START_TIME)}" if AUTO_START_TIME else "") + "</p>"]
+           + (f" · calls start automatically at {e(AUTO_START_TIME)}" if AUTO_START_TIME else "")
+           + (" · calling one patient at a time" if ONE_AT_A_TIME else "") + "</p>"]
     if not API_KEY or not AGENT_ID or "paste-your" in API_KEY + AGENT_ID:
         out.append("<div class='warn'>Bolna is not connected yet. Put your API key and agent ID in the .env file, then restart.</div>")
     if msg:
@@ -896,7 +938,11 @@ async def retry(appt_id: int):
         ).fetchone()
         if appt:
             audit(c, "receptionist", "asked for another call", appt_label(appt))
-    if appt:
+    if appt and ONE_AT_A_TIME:
+        with db() as c:
+            c.execute("UPDATE appointments SET status='queued' WHERE id=?", (appt_id,))
+        await call_next_in_queue()
+    elif appt:
         async with httpx.AsyncClient() as client:
             await call_one(client, appt)
     return go("/")
