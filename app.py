@@ -119,7 +119,8 @@ def init_db():
         )
         have = {r["name"] for r in c.execute("PRAGMA table_info(appointments)")}
         for col, kind in [("next_call_at", "TEXT"), ("moved_from", "TEXT"),
-                          ("offered_slots", "TEXT"), ("source", "TEXT DEFAULT 'csv'")]:
+                          ("offered_slots", "TEXT"), ("source", "TEXT DEFAULT 'csv'"),
+                          ("visit_notes", "TEXT"), ("urgent", "INTEGER DEFAULT 0")]:
             if col not in have:
                 c.execute(f"ALTER TABLE appointments ADD COLUMN {col} {kind}")
 
@@ -194,6 +195,16 @@ def find_field(data, name):
             if found is not None:
                 return found
     return None
+
+
+def visit_info(extracted):
+    """Visit notes in the patient's own words, and whether they described something urgent."""
+    notes = find_field(extracted, "visit_notes")
+    notes = str(notes).strip() if notes else ""
+    if notes.lower() in ("none", "null", "not asked", "n/a"):
+        notes = ""
+    urgent = str(find_field(extracted, "urgent") or "").strip().lower() == "yes"
+    return notes, urgent
 
 
 def audit(c, actor, action, record, before="", after=""):
@@ -367,6 +378,8 @@ def apply_result(appt_id, ex):
 
         note = find_field(extracted, "callback_note")
         new_date, new_time, moved_from = appt["appointment_date"], appt["appointment_time"], appt["moved_from"]
+        visit_notes, urgent = visit_info(extracted)
+        visit_notes = visit_notes or appt["visit_notes"]
 
         if final == "rescheduled":
             # Which of the offered options did the patient pick?
@@ -392,6 +405,11 @@ def apply_result(appt_id, ex):
 
         release_holds(c, f"appt:{appt_id}")
 
+        if urgent and final in ("confirmed", "rescheduled", "needs_human"):
+            # The appointment stands, but a person must phone this patient now.
+            final = "needs_human"
+            note = "URGENT: the patient described symptoms that may need attention now. Please phone them."
+
         next_at = None
         if final == "unreachable":
             due = now() + timedelta(minutes=RETRY_MINUTES)
@@ -402,13 +420,13 @@ def apply_result(appt_id, ex):
         c.execute(
             "UPDATE appointments SET status=?, call_status=?, duration=?, transcript=?, summary=?, "
             "answered_by=?, callback_note=?, recording_url=?, error=?, next_call_at=?, "
-            "appointment_date=?, appointment_time=?, moved_from=? WHERE id=?",
+            "appointment_date=?, appointment_time=?, moved_from=?, visit_notes=?, urgent=? WHERE id=?",
             (
                 final, status, duration, ex.get("transcript"),
                 ex.get("summary") or find_field(extracted, "call summary"),
                 find_field(extracted, "answered_by"), note,
                 telephony.get("recording_url"), ex.get("error_message") or None, next_at,
-                new_date, new_time, moved_from, appt_id,
+                new_date, new_time, moved_from, visit_notes, 1 if urgent else 0, appt_id,
             ),
         )
         log_attempt_end(c, ex, final)
@@ -523,14 +541,21 @@ def finish_offer(offer, ex=None, expired=False):
                       (person["patient_name"], slot["id"]))
             c.execute("UPDATE waitlist SET status='booked' WHERE id=?", (person["id"],))
             telephony = ex.get("telephony_data") or {}
+            visit_notes, urgent = visit_info(extracted)
+            # If this same phone number held (and cancelled) this exact time, replace that old row.
+            c.execute("DELETE FROM appointments WHERE phone=? AND appointment_date=? AND appointment_time=? AND status='cancelled'",
+                      (person["phone"], slot["slot_date"], slot["slot_time"]))
             c.execute(
                 "INSERT OR IGNORE INTO appointments (patient_name, phone, doctor_name, appointment_date, appointment_time, "
                 "preferred_language, status, source, summary, transcript, recording_url, duration, execution_id, "
-                "call_status, attempts, last_call_at, created_at) VALUES (?,?,?,?,?,?,'confirmed','waitlist',?,?,?,?,?,?,1,?,?)",
+                "call_status, attempts, last_call_at, created_at, visit_notes, urgent, callback_note) "
+                "VALUES (?,?,?,?,?,?,?,'waitlist',?,?,?,?,?,?,1,?,?,?,?,?)",
                 (person["patient_name"], person["phone"], slot["doctor_name"], slot["slot_date"], slot["slot_time"],
-                 person["preferred_language"], ex.get("summary") or find_field(extracted, "call summary"),
+                 person["preferred_language"], "needs_human" if urgent else "confirmed",
+                 ex.get("summary") or find_field(extracted, "call summary"),
                  ex.get("transcript"), telephony.get("recording_url"), duration, ex.get("id"), status,
-                 offer["created_at"], stamp()),
+                 offer["created_at"], stamp(), visit_notes, 1 if urgent else 0,
+                 "URGENT: the patient described symptoms that may need attention now. Please phone them." if urgent else None),
             )
             audit(c, "system", "slot refilled from waitlist",
                   f"{slot['doctor_name']}, {slot['slot_date']} {slot['slot_time']}", "free", person["patient_name"])
@@ -637,6 +662,8 @@ select.small{padding:3px;font-size:12px}
 .warn{background:#fff0cc;border:1px solid #f0d58a;border-radius:8px;padding:10px;margin-bottom:16px}
 .err{color:#8f1d15;font-size:12px} .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .muted{color:#5b6472;font-size:12px}
+.visit{background:#f5f6f8;border-radius:6px;padding:6px 8px;margin:4px 0;white-space:pre-wrap}
+@media print{nav,.noprint{display:none} body{background:#fff} .card{border:0;padding:0}}
 details summary{cursor:pointer;color:#1d4ed8} pre{white-space:pre-wrap;font-size:12px;background:#f5f6f8;padding:8px;border-radius:6px}
 """
 
@@ -647,7 +674,7 @@ LABELS = {"pending": "Not called yet", "calling": "Calling now", "retry_wait": "
 
 def page(body, active="/", refresh=False):
     meta = '<meta http-equiv="refresh" content="10">' if refresh else ""
-    links = [("/", "Dashboard"), ("/slots", "Free slots"), ("/waitlist", "Waitlist"), ("/log", "Activity log")]
+    links = [("/", "Dashboard"), ("/sheet", "Doctor's sheet"), ("/slots", "Free slots"), ("/waitlist", "Waitlist"), ("/log", "Activity log")]
     nav = "<nav>" + "".join(f"<a href='{u}' class='{'on' if u == active else ''}'>{t}</a>" for u, t in links) + "</nav>"
     return HTMLResponse(
         f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -686,7 +713,7 @@ def freed_slots_panel(c):
 def dashboard(msg: str = "", status: str = "", date: str = ""):
     with db() as c:
         all_rows = c.execute(
-            "SELECT * FROM appointments ORDER BY CASE status WHEN 'needs_human' THEN 0 WHEN 'unreachable' THEN 1 "
+            "SELECT * FROM appointments ORDER BY urgent DESC, CASE status WHEN 'needs_human' THEN 0 WHEN 'unreachable' THEN 1 "
             "ELSE 2 END, appointment_date, appointment_time"
         ).fetchall()
         attempts = {}
@@ -752,7 +779,10 @@ def dashboard(msg: str = "", status: str = "", date: str = ""):
             if r["answered_by"] == "other":
                 notes.append("Answered by someone else.")
             if r["callback_note"] and str(r["callback_note"]).strip().lower() != "none":
-                notes.append(e(str(r["callback_note"])))
+                text = e(str(r["callback_note"]))
+                notes.append(f"<b class='err'>{text}</b>" if r["urgent"] else text)
+            if r["visit_notes"]:
+                notes.append(f"<div class='visit'><span class='muted'>Visit notes (patient's words)</span><br>{e(r['visit_notes'])}</div>")
             if r["status"] == "calling":
                 notes.append(f"Call status: {e(r['call_status'] or '')}")
             if r["status"] == "retry_wait":
@@ -911,18 +941,57 @@ def export(date: str = ""):
     with db() as c:
         rows = c.execute(
             "SELECT appointment_date, appointment_time, patient_name, phone, doctor_name, status, attempts, "
-            "last_call_at, answered_by, callback_note, moved_from, source, summary, execution_id "
+            "last_call_at, answered_by, callback_note, moved_from, source, visit_notes, summary, execution_id "
             "FROM appointments WHERE (?='' OR appointment_date=?) ORDER BY appointment_date, appointment_time",
             (date, date)).fetchall()
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["appointment_date", "appointment_time", "patient_name", "phone", "doctor_name", "outcome", "tries",
-                "last_call_at", "answered_by", "callback_note", "moved_from", "source", "summary", "bolna_execution_id"])
+                "last_call_at", "answered_by", "callback_note", "moved_from", "source", "visit_notes", "summary", "bolna_execution_id"])
     for r in rows:
         w.writerow(list(r))
     name = f"results-{date or 'all'}.csv"
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": f"attachment; filename={name}"})
+
+
+# ---------- doctor's sheet ----------
+
+@app.get("/sheet", response_class=HTMLResponse)
+def sheet(date: str = ""):
+    """One printable page per day: who is coming and what they said the visit is about."""
+    with db() as c:
+        dates = [r[0] for r in c.execute("SELECT DISTINCT appointment_date FROM appointments ORDER BY 1")]
+        if not date:
+            tomorrow = (now().date() + timedelta(days=1)).isoformat()
+            date = tomorrow if tomorrow in dates else (dates[-1] if dates else "")
+        rows = c.execute(
+            "SELECT * FROM appointments WHERE appointment_date=? AND status NOT IN ('cancelled') "
+            "ORDER BY doctor_name COLLATE NOCASE, appointment_time", (date,)).fetchall()
+    opts = "".join(f"<option {'selected' if d == date else ''}>{e(d)}</option>" for d in dates)
+    out = ["<h1>Doctor's sheet</h1><p class='sub'>Visit notes are what the patient said on the phone, in their own words. "
+           "They are not a diagnosis and have not been checked.</p>",
+           f"<div class='card noprint'><form method='get' action='/sheet' class='row'><select name='date' onchange='this.form.submit()'>{opts}</select>"
+           "<button type='button' onclick='window.print()'>Print</button></form></div>"]
+    if not rows:
+        out.append("<div class='card'>No appointments for this date.</div>")
+    doctor = None
+    for r in rows:
+        if (r["doctor_name"] or "").lower() != (doctor or "").lower():
+            if doctor is not None:
+                out.append("</table></div>")
+            doctor = r["doctor_name"]
+            out.append(f"<div class='card'><h2>{e(doctor)} · {e(spoken_date(date))}</h2>"
+                       "<table><tr><th>Time</th><th>Patient</th><th>Status</th><th>Visit notes</th></tr>")
+        notes = e(r["visit_notes"]) if r["visit_notes"] else "<span class='muted'>None given</span>"
+        if r["urgent"]:
+            notes = "<b class='err'>Flagged urgent on the call.</b><br>" + notes
+        out.append(f"<tr><td>{e(r['appointment_time'])}</td><td>{e(r['patient_name'])}</td>"
+                   f"<td><span class='pill {e(r['status'])}'>{LABELS.get(r['status'], r['status'])}</span></td>"
+                   f"<td style='white-space:pre-wrap'>{notes}</td></tr>")
+    if doctor is not None:
+        out.append("</table></div>")
+    return page("".join(out), "/sheet")
 
 
 # ---------- free slots page ----------
